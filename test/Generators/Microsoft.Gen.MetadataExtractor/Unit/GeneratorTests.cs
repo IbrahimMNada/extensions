@@ -176,12 +176,12 @@ public class GeneratorTests(ITestOutputHelper output)
             var options = new Dictionary<string, string>
             {
                 ["build_property.projectdir"] = projectDir,
-                ["build_property.MetadataReportOutputPath"] = fullReportPath
+                ["build_property.outputpath"] = outputPath
             };
 
-            var diags = await RunGenerator(await File.ReadAllTextAsync(inputFile), options);
+            var diags = await RunGenerator(await File.ReadAllTextAsync(inputFile), analyzerOptions: options);
             Assert.Empty(diags);
-            Assert.True(File.Exists(Path.Combine(fullReportPath, ReportFilename)));
+            Assert.True(File.Exists(Path.Combine(fullReportPath, "MetadataReport.json")));
         }
         finally
         {
