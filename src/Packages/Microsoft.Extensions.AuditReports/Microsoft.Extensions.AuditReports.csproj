@@ -21,7 +21,7 @@
 
 
   <ItemGroup>
-    <ProjectReference Include="..\..\Generators\Microsoft.Gen.MetadataExtractor\Microsoft.Gen.MetadataExtractor.csproj" />
+    <AnalyzerReference Include="..\..\Generators\Microsoft.Gen.MetadataExtractor\Microsoft.Gen.MetadataExtractor.csproj" />
   </ItemGroup>
 
 </Project>
