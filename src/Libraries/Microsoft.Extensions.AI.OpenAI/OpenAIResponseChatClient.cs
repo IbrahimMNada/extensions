@@ -13,8 +13,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Shared.Diagnostics;
 using OpenAI.Responses;
-using static Microsoft.Extensions.AI.OpenAIChatClient;
 
+#pragma warning disable S907 // "goto" statement should not be used
 #pragma warning disable S1067 // Expressions should not be too complex
 #pragma warning disable S3011 // Reflection should not be used to increase accessibility of classes, methods, or fields
 #pragma warning disable S3604 // Member initializer values should not be redundant
@@ -25,12 +25,6 @@ namespace Microsoft.Extensions.AI;
 /// <summary>Represents an <see cref="IChatClient"/> for an <see cref="OpenAIResponseClient"/>.</summary>
 internal sealed partial class OpenAIResponseChatClient : IChatClient
 {
-    /// <summary>Gets the default OpenAI endpoint.</summary>
-    private static Uri DefaultOpenAIEndpoint { get; } = new("https://api.openai.com/v1");
-
-    /// <summary>A <see cref="ChatRole"/> for "developer".</summary>
-    private static readonly ChatRole _chatRoleDeveloper = new("developer");
-
     /// <summary>Metadata about the client.</summary>
     private readonly ChatClientMetadata _metadata;
 
@@ -51,7 +45,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         // implement the abstractions directly rather than providing adapters on top of the public APIs,
         // the package can provide such implementations separate from what's exposed in the public API.
         Uri providerUrl = typeof(OpenAIResponseClient).GetField("_endpoint", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            ?.GetValue(responseClient) as Uri ?? DefaultOpenAIEndpoint;
+            ?.GetValue(responseClient) as Uri ?? OpenAIClientExtensions.DefaultOpenAIEndpoint;
         string? model = typeof(OpenAIResponseClient).GetField("_model", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
             ?.GetValue(responseClient) as string;
 
@@ -87,12 +81,13 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         // Convert and return the results.
         ChatResponse response = new()
         {
-            ResponseId = openAIResponse.Id,
-            ConversationId = openAIResponse.Id,
+            ConversationId = openAIOptions.StoredOutputEnabled is false ? null : openAIResponse.Id,
             CreatedAt = openAIResponse.CreatedAt,
             FinishReason = ToFinishReason(openAIResponse.IncompleteStatusDetails?.Reason),
             Messages = [new(ChatRole.Assistant, [])],
             ModelId = openAIResponse.Model,
+            RawRepresentation = openAIResponse,
+            ResponseId = openAIResponse.Id,
             Usage = ToUsageDetails(openAIResponse),
         };
 
@@ -125,12 +120,20 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
 
                     case FunctionCallResponseItem functionCall:
                         response.FinishReason ??= ChatFinishReason.ToolCalls;
-                        message.Contents.Add(
-                            FunctionCallContent.CreateFromParsedArguments(
-                                functionCall.FunctionArguments.ToMemory(),
-                                functionCall.CallId,
-                                functionCall.FunctionName,
-                                static json => JsonSerializer.Deserialize(json.Span, ResponseClientJsonContext.Default.IDictionaryStringObject)!));
+                        var fcc = FunctionCallContent.CreateFromParsedArguments(
+                            functionCall.FunctionArguments.ToMemory(),
+                            functionCall.CallId,
+                            functionCall.FunctionName,
+                            static json => JsonSerializer.Deserialize(json.Span, ResponseClientJsonContext.Default.IDictionaryStringObject)!);
+                        fcc.RawRepresentation = outputItem;
+                        message.Contents.Add(fcc);
+                        break;
+
+                    default:
+                        message.Contents.Add(new()
+                        {
+                            RawRepresentation = outputItem,
+                        });
                         break;
                 }
             }
@@ -157,6 +160,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         // Make the call to the OpenAIResponseClient and process the streaming results.
         DateTimeOffset? createdAt = null;
         string? responseId = null;
+        string? conversationId = null;
         string? modelId = null;
         string? lastMessageId = null;
         ChatRole? lastRole = null;
@@ -169,21 +173,23 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                 case StreamingResponseCreatedUpdate createdUpdate:
                     createdAt = createdUpdate.Response.CreatedAt;
                     responseId = createdUpdate.Response.Id;
+                    conversationId = openAIOptions.StoredOutputEnabled is false ? null : responseId;
                     modelId = createdUpdate.Response.Model;
-                    break;
+                    goto default;
 
                 case StreamingResponseCompletedUpdate completedUpdate:
                     yield return new()
                     {
                         Contents = ToUsageDetails(completedUpdate.Response) is { } usage ? [new UsageContent(usage)] : [],
+                        ConversationId = conversationId,
                         CreatedAt = createdAt,
-                        ResponseId = responseId,
-                        ConversationId = responseId,
                         FinishReason =
                             ToFinishReason(completedUpdate.Response?.IncompleteStatusDetails?.Reason) ??
                             (functionCallInfos is not null ? ChatFinishReason.ToolCalls : ChatFinishReason.Stop),
                         MessageId = lastMessageId,
                         ModelId = modelId,
+                        RawRepresentation = streamingUpdate,
+                        ResponseId = responseId,
                         Role = lastRole,
                     };
                     break;
@@ -200,11 +206,11 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                             break;
                     }
 
-                    break;
+                    goto default;
 
                 case StreamingResponseOutputItemDoneUpdate outputItemDoneUpdate:
                     _ = outputIndexToMessages.Remove(outputItemDoneUpdate.OutputIndex);
-                    break;
+                    goto default;
 
                 case StreamingResponseOutputTextDeltaUpdate outputTextDeltaUpdate:
                     _ = outputIndexToMessages.TryGetValue(outputTextDeltaUpdate.OutputIndex, out MessageResponseItem? messageItem);
@@ -212,11 +218,12 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                     lastRole = ToChatRole(messageItem?.Role);
                     yield return new ChatResponseUpdate(lastRole, outputTextDeltaUpdate.Delta)
                     {
+                        ConversationId = conversationId,
                         CreatedAt = createdAt,
                         MessageId = lastMessageId,
                         ModelId = modelId,
+                        RawRepresentation = streamingUpdate,
                         ResponseId = responseId,
-                        ConversationId = responseId,
                     };
                     break;
 
@@ -227,7 +234,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                         _ = (callInfo.Arguments ??= new()).Append(functionCallArgumentsDeltaUpdate.Delta);
                     }
 
-                    break;
+                    goto default;
                 }
 
                 case StreamingResponseFunctionCallArgumentsDoneUpdate functionCallOutputDoneUpdate:
@@ -246,26 +253,23 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                         lastRole = ChatRole.Assistant;
                         yield return new ChatResponseUpdate(lastRole, [fci])
                         {
+                            ConversationId = conversationId,
                             CreatedAt = createdAt,
                             MessageId = lastMessageId,
                             ModelId = modelId,
+                            RawRepresentation = streamingUpdate,
                             ResponseId = responseId,
-                            ConversationId = responseId,
                         };
+
+                        break;
                     }
 
-                    break;
+                    goto default;
                 }
 
                 case StreamingResponseErrorUpdate errorUpdate:
                     yield return new ChatResponseUpdate
                     {
-                        CreatedAt = createdAt,
-                        MessageId = lastMessageId,
-                        ModelId = modelId,
-                        ResponseId = responseId,
-                        Role = lastRole,
-                        ConversationId = responseId,
                         Contents =
                         [
                             new ErrorContent(errorUpdate.Message)
@@ -274,19 +278,40 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                                 Details = errorUpdate.Param,
                             }
                         ],
+                        ConversationId = conversationId,
+                        CreatedAt = createdAt,
+                        MessageId = lastMessageId,
+                        ModelId = modelId,
+                        RawRepresentation = streamingUpdate,
+                        ResponseId = responseId,
+                        Role = lastRole,
                     };
                     break;
 
                 case StreamingResponseRefusalDoneUpdate refusalDone:
                     yield return new ChatResponseUpdate
                     {
+                        Contents = [new ErrorContent(refusalDone.Refusal) { ErrorCode = nameof(ResponseContentPart.Refusal) }],
+                        ConversationId = conversationId,
                         CreatedAt = createdAt,
                         MessageId = lastMessageId,
                         ModelId = modelId,
+                        RawRepresentation = streamingUpdate,
                         ResponseId = responseId,
                         Role = lastRole,
-                        ConversationId = responseId,
-                        Contents = [new ErrorContent(refusalDone.Refusal) { ErrorCode = nameof(ResponseContentPart.Refusal) }],
+                    };
+                    break;
+
+                default:
+                    yield return new ChatResponseUpdate
+                    {
+                        ConversationId = conversationId,
+                        CreatedAt = createdAt,
+                        MessageId = lastMessageId,
+                        ModelId = modelId,
+                        RawRepresentation = streamingUpdate,
+                        ResponseId = responseId,
+                        Role = lastRole,
                     };
                     break;
             }
@@ -304,7 +329,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         role switch
         {
             MessageRole.System => ChatRole.System,
-            MessageRole.Developer => _chatRoleDeveloper,
+            MessageRole.Developer => OpenAIClientExtensions.ChatRoleDeveloper,
             MessageRole.User => ChatRole.User,
             _ => ChatRole.Assistant,
         };
@@ -334,6 +359,12 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         result.TopP ??= options.TopP;
         result.Temperature ??= options.Temperature;
         result.ParallelToolCallsEnabled ??= options.AllowMultipleToolCalls;
+        if (options.Instructions is { } instructions)
+        {
+            result.Instructions = string.IsNullOrEmpty(result.Instructions) ?
+                instructions :
+                $"{result.Instructions}{Environment.NewLine}{instructions}";
+        }
 
         // Populate tools if there are any.
         if (options.Tools is { Count: > 0 } tools)
@@ -342,10 +373,17 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
             {
                 switch (tool)
                 {
-                    case AIFunction af:
-                        var oaitool = JsonSerializer.Deserialize(SchemaTransformCache.GetOrCreateTransformedSchema(af), ResponseClientJsonContext.Default.ResponseToolJson)!;
+                    case AIFunction aiFunction:
+                        bool strict =
+                            aiFunction.AdditionalProperties.TryGetValue(OpenAIClientExtensions.StrictKey, out object? strictObj) &&
+                            strictObj is bool strictValue &&
+                            strictValue;
+
+                        JsonElement jsonSchema = OpenAIClientExtensions.GetSchema(aiFunction, strict);
+
+                        var oaitool = JsonSerializer.Deserialize(jsonSchema, ResponseClientJsonContext.Default.ResponseToolJson)!;
                         var functionParameters = BinaryData.FromBytes(JsonSerializer.SerializeToUtf8Bytes(oaitool, ResponseClientJsonContext.Default.ResponseToolJson));
-                        result.Tools.Add(ResponseTool.CreateFunctionTool(af.Name, af.Description, functionParameters));
+                        result.Tools.Add(ResponseTool.CreateFunctionTool(aiFunction.Name, aiFunction.Description, functionParameters, strict));
                         break;
 
                     case HostedWebSearchTool:
@@ -402,7 +440,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
             {
                 result.TextOptions = new()
                 {
-                    TextFormat = SchemaTransformCache.GetOrCreateTransformedSchema(jsonFormat) is { } jsonSchema ?
+                    TextFormat = OpenAIClientExtensions.StrictSchemaTransformCache.GetOrCreateTransformedSchema(jsonFormat) is { } jsonSchema ?
                         ResponseTextFormat.CreateJsonSchemaFormat(
                             jsonFormat.SchemaName ?? "json_schema",
                             BinaryData.FromBytes(JsonSerializer.SerializeToUtf8Bytes(jsonSchema, ResponseClientJsonContext.Default.JsonElement)),
@@ -422,7 +460,7 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
         foreach (ChatMessage input in inputs)
         {
             if (input.Role == ChatRole.System ||
-                input.Role == _chatRoleDeveloper)
+                input.Role == OpenAIClientExtensions.ChatRoleDeveloper)
             {
                 string text = input.Text;
                 if (!string.IsNullOrWhiteSpace(text))
@@ -487,6 +525,10 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
                                     callContent.Arguments,
                                     AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IDictionary<string, object?>)))));
                             break;
+
+                        case AIContent when item.RawRepresentation is ResponseItem rawRep:
+                            yield return rawRep;
+                            break;
                     }
                 }
 
@@ -530,11 +572,25 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
             switch (part.Kind)
             {
                 case ResponseContentPartKind.OutputText:
-                    results.Add(new TextContent(part.Text));
+                    results.Add(new TextContent(part.Text)
+                    {
+                        RawRepresentation = part,
+                    });
                     break;
 
                 case ResponseContentPartKind.Refusal:
-                    results.Add(new ErrorContent(part.Refusal) { ErrorCode = nameof(ResponseContentPartKind.Refusal) });
+                    results.Add(new ErrorContent(part.Refusal)
+                    {
+                        ErrorCode = nameof(ResponseContentPartKind.Refusal),
+                        RawRepresentation = part,
+                    });
+                    break;
+
+                default:
+                    results.Add(new()
+                    {
+                        RawRepresentation = part,
+                    });
                     break;
             }
         }
@@ -569,6 +625,10 @@ internal sealed partial class OpenAIResponseChatClient : IChatClient
 
                 case ErrorContent errorContent when errorContent.ErrorCode == nameof(ResponseContentPartKind.Refusal):
                     parts.Add(ResponseContentPart.CreateRefusalPart(errorContent.Message));
+                    break;
+
+                case AIContent when content.RawRepresentation is ResponseContentPart rawRep:
+                    parts.Add(rawRep);
                     break;
             }
         }
